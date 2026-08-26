@@ -1,5 +1,5 @@
 {
   "rewrites": [
-    { "source": "/(.*)", "destination": "/Survey8B-frontend.html" }
+    { "source": "/((?!images/).*)", "destination": "/Survey8B-frontend.html" }
   ]
 }
