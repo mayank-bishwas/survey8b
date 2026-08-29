@@ -213,7 +213,10 @@ CREATE TABLE IF NOT EXISTS survey_runs (
     persona_model TEXT,
     summary_model TEXT,
     cost JSONB,
-    timing JSONB
+    timing JSONB,
+    copy_count INT NOT NULL DEFAULT 0,
+    screenshot_count INT NOT NULL DEFAULT 0,
+    download_count INT NOT NULL DEFAULT 0
 )
 """
 
@@ -231,7 +234,46 @@ ALTER TABLE survey_runs ALTER COLUMN sample_size DROP NOT NULL;
 ALTER TABLE survey_runs ALTER COLUMN matched_count DROP NOT NULL;
 ALTER TABLE survey_runs ALTER COLUMN categories DROP NOT NULL;
 ALTER TABLE survey_runs ALTER COLUMN distribution DROP NOT NULL;
+ALTER TABLE survey_runs ADD COLUMN IF NOT EXISTS copy_count INT NOT NULL DEFAULT 0;
+ALTER TABLE survey_runs ADD COLUMN IF NOT EXISTS screenshot_count INT NOT NULL DEFAULT 0;
+ALTER TABLE survey_runs ADD COLUMN IF NOT EXISTS download_count INT NOT NULL DEFAULT 0;
 """
+
+# What the frontend is allowed to increment, mapped to the column it bumps.
+# A whitelist rather than string interpolation of whatever the client sends,
+# since /api/track is a public unauthenticated endpoint.
+TRACKABLE_ACTIONS = {
+    "copy": "copy_count",
+    "screenshot": "screenshot_count",
+    "download": "download_count",
+}
+
+
+def record_action(payload: dict[str, Any]) -> dict[str, Any]:
+    """Bump one of the per-run action counters. Analytics only — every
+    failure mode here is reported back as a plain response rather than
+    raised, because a lost count must never surface as an error in the UI."""
+    action = payload.get("action")
+    column = TRACKABLE_ACTIONS.get(action)
+    if column is None:
+        raise ValidationError(f"Unknown action: {action!r}")
+
+    try:
+        run_id = int(payload.get("run_id"))
+    except (TypeError, ValueError):
+        raise ValidationError("run_id must be an integer") from None
+
+    db_url = os.environ["NEON_DATABASE_URL"]
+    with psycopg.connect(db_url) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"UPDATE survey_runs SET {column} = {column} + 1 WHERE id = %s",
+                [run_id],
+            )
+            updated = cur.rowcount
+        conn.commit()
+
+    return {"ok": bool(updated)}
 
 
 def ensure_survey_runs_table() -> None:
@@ -259,12 +301,16 @@ def log_survey_run(
     summary_model: str | None = None,
     cost: Any | None = None,
     timing: Any | None = None,
-) -> None:
+) -> int | None:
     """Best-effort analytics log — failures here must never break the
     user-facing response, so this is called from a broad try/except.
     Logs every attempt (success, validation_error, pipeline_error), not just
     successes, so post-launch issues are visible without relying on users
-    to report them."""
+    to report them.
+
+    Returns the new row's id, which the successful-run path hands back to
+    the frontend as run_id so later /api/track calls can attribute copy /
+    screenshot / download clicks to this specific run."""
     db_url = os.environ["NEON_DATABASE_URL"]
     with psycopg.connect(db_url) as conn:
         with conn.cursor() as cur:
@@ -276,6 +322,7 @@ def log_survey_run(
                     summary, category_model, persona_model, summary_model,
                     cost, timing
                 ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                RETURNING id
                 """,
                 [
                     status,
@@ -295,7 +342,9 @@ def log_survey_run(
                     json.dumps(timing) if timing is not None else None,
                 ],
             )
+            row = cur.fetchone()
         conn.commit()
+    return row[0] if row else None
 
 
 def run_survey_pipeline(body: dict[str, Any]) -> dict[str, Any]:
@@ -399,6 +448,14 @@ def _run_survey_pipeline_inner(body: dict[str, Any]) -> dict[str, Any]:
     summary_call_fn = functools.partial(
         s2.call_openrouter, os.environ["OPENROUTER_API_KEY"], s2.SUMMARY_MODEL
     )
+    # Gemma intermittently returns valid JSON with garbage values instead of
+    # text (observed in survey_runs: {"key_takeaway": -999}, {"key_takeaway":
+    # -5, "summary": -100}, {}), and retrying the same model on the same input
+    # tends to reproduce it rather than recover. gpt-4o-mini already drives the
+    # category and persona steps reliably, so it's the fallback.
+    summary_fallback_call_fn = functools.partial(
+        s2.call_openai, openai_client, s2.CATEGORY_MODEL_NAME
+    )
 
     category_start = time.perf_counter()
     categories, category_usage = s2.derive_categories(category_call_fn, question)
@@ -422,15 +479,23 @@ def _run_survey_pipeline_inner(body: dict[str, Any]) -> dict[str, Any]:
     summary_start = time.perf_counter()
     summary_text = summary_usage = None
     summary_error: Exception | None = None
-    try:
-        for _attempt in range(3):
+    summary_model_used = s2.SUMMARY_MODEL
+    # (call_fn, model_name, attempts) — exhaust the primary model first, then
+    # fall back to a different one. Retrying Gemma on the same input reproduces
+    # its garbage-value failures rather than recovering from them, so a
+    # same-model retry budget alone isn't enough.
+    summary_plan = [
+        (summary_call_fn, s2.SUMMARY_MODEL, 3),
+        (summary_fallback_call_fn, s2.CATEGORY_MODEL_NAME, 2),
+    ]
+    for plan_call_fn, plan_model, plan_attempts in summary_plan:
+        for _attempt in range(plan_attempts):
             try:
                 candidate_text, candidate_usage = s2.generate_summary(
-                    summary_call_fn, question, summary["distribution"], results, len(results)
+                    plan_call_fn, question, summary["distribution"], results, len(results)
                 )
-                # s2.generate_summary() only rejects empty strings; Gemma has been
-                # observed to occasionally return a short degenerate response
-                # (e.g. "-0.0") that's non-empty but useless — retry on those too,
+                # s2.generate_summary() only rejects empty strings; a non-empty
+                # but useless response (e.g. "-0.0") still needs to be retried,
                 # matching the persona-call and category-derivation resilience
                 # already applied elsewhere in the pipeline.
                 if _looks_degenerate(candidate_text["key_takeaway"]) or _looks_degenerate(
@@ -438,28 +503,25 @@ def _run_survey_pipeline_inner(body: dict[str, Any]) -> dict[str, Any]:
                 ):
                     raise ValueError(f"Degenerate summary response: {candidate_text!r}")
                 summary_text, summary_usage = candidate_text, candidate_usage
+                summary_model_used = plan_model
                 summary_error = None
                 break
-            except ValueError as exc:
+            except Exception as exc:  # noqa: BLE001
+                # ValueError = malformed/degenerate content; anything else is a
+                # transport-level failure (timeout, HTTP error) from the
+                # provider call, which already retries internally. Both are
+                # worth moving on from rather than failing the whole request.
                 summary_error = exc
-    except Exception as exc:  # noqa: BLE001
-        # A transport-level failure (timeout, HTTP error) from
-        # s2.call_openrouter, which already retries internally — no point
-        # retrying again at this level. Fall through to the no-summary
-        # response below instead of failing the whole request: the
-        # distribution is deterministic and fully valid on its own, and
-        # Gemma summarization latency has been observed to swing widely
-        # (roughly 10-228s), so an occasional miss here is expected.
-        summary_error = exc
+        if summary_text is not None:
+            break
     summary_elapsed = time.perf_counter() - summary_start
 
     if summary_text is None:
         print(f"[survey8b_api] summarization unavailable, returning distribution without AI summary: {summary_error}")
         summary_usage = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0, "cost_usd": 0.0}
         key_takeaway_value = (
-            "AI-written summary unavailable for this run (the summarization step "
-            "didn't respond in time) — the response distribution above is complete "
-            "and accurate."
+            "AI-written summary unavailable for this run — the response "
+            "distribution above is complete and accurate."
         )
         summary_value = ""
     else:
@@ -495,7 +557,7 @@ def _run_survey_pipeline_inner(body: dict[str, Any]) -> dict[str, Any]:
         ],
         "category_model": s2.CATEGORY_MODEL_NAME,
         "persona_model": s2.PERSONA_MODEL_NAME,
-        "summary_model": s2.SUMMARY_MODEL,
+        "summary_model": summary_model_used,
         "cost": summary["cost"],
         "timing": {
             "category_derivation_seconds": round(category_elapsed, 3),
@@ -506,7 +568,7 @@ def _run_survey_pipeline_inner(body: dict[str, Any]) -> dict[str, Any]:
     }
 
     try:
-        log_survey_run(
+        response["run_id"] = log_survey_run(
             "success" if summary_text is not None else "success_no_summary",
             None if summary_text is not None else str(summary_error),
             response["question"], response["filters"],
@@ -517,6 +579,7 @@ def _run_survey_pipeline_inner(body: dict[str, Any]) -> dict[str, Any]:
         )
     except Exception as exc:  # noqa: BLE001
         print(f"[survey8b_api] survey_runs logging failed (non-fatal): {exc}")
+        response["run_id"] = None
 
     return response
 
@@ -542,7 +605,7 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_POST(self) -> None:  # noqa: N802
-        if self.path not in ("/api/facets", "/api/run-survey"):
+        if self.path not in ("/api/facets", "/api/run-survey", "/api/track"):
             self._send_json(404, {"error": "Not found"})
             return
 
@@ -557,6 +620,8 @@ class Handler(BaseHTTPRequestHandler):
                 db_url = os.environ["NEON_DATABASE_URL"]
                 with psycopg.connect(db_url) as conn:
                     result = get_facets(conn, payload)
+            elif self.path == "/api/track":
+                result = record_action(payload)
             else:
                 result = run_survey_pipeline(payload)
 
@@ -582,6 +647,7 @@ def main() -> None:
     print(f"Survey8B API listening on http://localhost:{PORT}")
     print("  POST /api/facets")
     print("  POST /api/run-survey")
+    print("  POST /api/track")
     server.serve_forever()
 
 
