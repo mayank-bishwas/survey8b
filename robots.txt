@@ -1,4 +1,4 @@
 User-agent: *
 Allow: /
 
-Sitemap: https://survey8b.com/sitemap.xml
+Sitemap: https://mayankbishwas.com/sitemap.xml
